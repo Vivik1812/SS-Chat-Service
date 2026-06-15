@@ -5,6 +5,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
+const amqp = require('amqplib');
 
 const app = express();
 const server = http.createServer(app);
@@ -33,9 +34,46 @@ const verificarToken = (token) => {
     }
 };
 
+// Conexión RabbitMQ
+let canalRabbit = null;
+
+const conectarRabbitMQ = async () => {
+    try {
+        const conexion = await amqp.connect({
+            hostname: process.env.RABBITMQ_HOST || 'gorilla.lmq.cloudamqp.com',
+            port: process.env.RABBITMQ_PORT || 5672,
+            username: process.env.RABBITMQ_USERNAME || 'wmjcvznb',
+            password: process.env.RABBITMQ_PASSWORD || 'kajL4rdiURb0bd1U2X7dFt_FQlCGoYkR',
+            vhost: process.env.RABBITMQ_VHOST || 'wmjcvznb'
+        });
+        canalRabbit = await conexion.createChannel();
+        await canalRabbit.assertExchange('exchange.publicaciones', 'direct', { durable: true });
+        console.log('RabbitMQ conectado desde Chat-Service');
+    } catch (err) {
+        console.error('Error conectando a RabbitMQ:', err.message);
+    }
+};
+
+const publicarNotificacion = async (usuarioId, mensaje) => {
+    if (!canalRabbit) return;
+    try {
+        const evento = {
+            usuarioId: usuarioId,
+            publicacionId: null,
+            mensaje: mensaje
+        };
+        canalRabbit.publish(
+            'exchange.publicaciones',
+            'publicacion.creada',
+            Buffer.from(JSON.stringify(evento))
+        );
+    } catch (err) {
+        console.error('Error publicando notificacion:', err.message);
+    }
+};
+
 // ─── REST ENDPOINTS ───────────────────────────────────────────
 
-// GET /api/v1/chat/conversaciones/:usuarioId
 app.get('/api/v1/chat/conversaciones/:usuarioId', async (req, res) => {
     const authHeader = req.headers['authorization'];
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -57,7 +95,6 @@ app.get('/api/v1/chat/conversaciones/:usuarioId', async (req, res) => {
     }
 });
 
-// GET /api/v1/chat/mensajes/:conversacionId
 app.get('/api/v1/chat/mensajes/:conversacionId', async (req, res) => {
     const authHeader = req.headers['authorization'];
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -77,7 +114,6 @@ app.get('/api/v1/chat/mensajes/:conversacionId', async (req, res) => {
     }
 });
 
-// POST /api/v1/chat/conversaciones
 app.post('/api/v1/chat/conversaciones', async (req, res) => {
     const authHeader = req.headers['authorization'];
     if (!authHeader) return res.status(401).json({ error: 'Token requerido' });
@@ -87,7 +123,6 @@ app.post('/api/v1/chat/conversaciones', async (req, res) => {
 
     const { usuario1_id, usuario2_id, publicacion_id } = req.body;
     try {
-        // Verificar si ya existe
         const existe = await pool.query(
             `SELECT * FROM conversaciones 
              WHERE (usuario1_id = $1 AND usuario2_id = $2) 
@@ -107,7 +142,6 @@ app.post('/api/v1/chat/conversaciones', async (req, res) => {
     }
 });
 
-// GET /actuator/health
 app.get('/actuator/health', (req, res) => {
     res.json({ status: 'UP' });
 });
@@ -128,7 +162,6 @@ io.on('connection', (socket) => {
 
     socket.on('unirse_conversacion', (conversacionId) => {
         socket.join(`conversacion_${conversacionId}`);
-        console.log(`Usuario ${socket.usuarioId} se unió a conversacion_${conversacionId}`);
     });
 
     socket.on('enviar_mensaje', async (data) => {
@@ -141,6 +174,23 @@ io.on('connection', (socket) => {
             );
             const mensaje = result.rows[0];
             io.to(`conversacion_${conversacion_id}`).emit('nuevo_mensaje', mensaje);
+
+            // Notificar al otro usuario via RabbitMQ
+            const conv = await pool.query(
+                `SELECT * FROM conversaciones WHERE id = $1`,
+                [conversacion_id]
+            );
+            if (conv.rows.length > 0) {
+                const conversacion = conv.rows[0];
+                const destinatarioId = Number(conversacion.usuario1_id) === Number(socket.usuarioId)
+                    ? conversacion.usuario2_id
+                    : conversacion.usuario1_id;
+
+                await publicarNotificacion(
+                    destinatarioId,
+                    `Tienes un nuevo mensaje en el chat`
+                );
+            }
         } catch (err) {
             socket.emit('error_mensaje', { error: err.message });
         }
@@ -154,6 +204,7 @@ io.on('connection', (socket) => {
 // ─── INICIAR SERVIDOR ─────────────────────────────────────────
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
     console.log(`SS-Chat-Service corriendo en puerto ${PORT}`);
+    await conectarRabbitMQ();
 });
